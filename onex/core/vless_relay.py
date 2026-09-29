@@ -23,7 +23,6 @@ from main import (
     is_ip_allowed,
     log_activity,
     now_ir,
-    is_destination_blocked,
 )
 from onex.core.traffic_limiter import throttle
 
@@ -113,6 +112,18 @@ async def parse_trojan_header(chunk: bytes):
         raise ValueError("missing trailing CRLF")
     pos += 2
     return pw_hash, command, address, port, chunk[pos:]
+
+
+_HEX = frozenset(b"0123456789abcdefABCDEF")
+
+
+def looks_like_trojan(chunk: bytes) -> bool:
+    """Trojan starts with hex(SHA224(password)) + CRLF; VLESS starts with 0x00."""
+    return (
+        len(chunk) >= 58
+        and chunk[56:58] == b"\r\n"
+        and all(b in _HEX for b in chunk[:56])
+    )
 
 
 async def check_and_use(uid: str, n: int) -> bool:
@@ -293,16 +304,12 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             return
 
         reply_prefix = b"\x00\x00"
-        # One account can carry both VLESS-WS and Trojan-WS (all-protocol /
-        # bundle subscriptions share /ws/{uuid}); pick the wire format from
-        # the handshake itself instead of the link's primary protocol.
-        _head = first_chunk[:58]
-        if len(_head) == 58 and _head[56:58] == b"\r\n" and all(c in b"0123456789abcdef" for c in _head[:56]):
-            protocol = "trojan-ws"
-        elif protocol == "trojan-ws" and first_chunk[:1] == b"\x00" and len(first_chunk) >= 18:
-            protocol = "vless-ws"
-        connections[conn_id]["transport"] = protocol
-        if protocol == "trojan-ws":
+        # /ws/{uuid} is shared by VLESS-WS and Trojan-WS. All-protocol and
+        # bundle subscriptions store only ONE primary protocol on the link,
+        # so trusting link["protocol"] made Trojan-WS get parsed as VLESS
+        # (garbage target -> no ping). Detect the real wire format instead.
+        if looks_like_trojan(first_chunk):
+            connections[conn_id]["transport"] = "trojan-ws"
             try:
                 pw_hash, command, address, port, payload = await parse_trojan_header(first_chunk)
             except Exception:
@@ -324,10 +331,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         stats["total_requests"] += 1
         connections[conn_id]["bytes"] += len(first_chunk)
         logger.info(f"➡️  [{conn_id}] → {address}:{port}")
-        if is_destination_blocked(address, link):
-            logger.info(f"🚫 blocked destination [{conn_id}] → {address}")
-            await ws.close(code=1008, reason="blocked destination")
-            return
 
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
         _tune_socket(writer)
